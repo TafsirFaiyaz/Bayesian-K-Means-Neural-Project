@@ -10,7 +10,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
 from sklearn.manifold import TSNE
-from sklearn.cluster import KMeans
 import pandas as pd
 from scipy import stats
 import warnings
@@ -25,38 +24,31 @@ def set_seed(seed=42):
 
 # Differentiable K-Means Layer
 class DifferentiableKMeans(nn.Module):
-    def __init__(self, n_clusters, feature_dim, temperature=1.0):
+    def __init__(self, n_clusters, feature_dim, temperature=5.0):
         super().__init__()
         self.n_clusters = n_clusters
         self.temperature = temperature
-        # Initialize cluster centers with better spread
-        self.centers = nn.Parameter(torch.randn(n_clusters, feature_dim) * 0.5)
-        # Use orthogonal initialization for better separation
+        # Smaller random init for stability
+        self.centers = nn.Parameter(torch.randn(n_clusters, feature_dim) * 0.1)
+        # Orthogonal with low gain
         if feature_dim >= n_clusters:
-            nn.init.orthogonal_(self.centers)
-        # Add small noise for diversity
-        self.centers.data += torch.randn_like(self.centers) * 0.01
+            nn.init.orthogonal_(self.centers, gain=0.1)
+        # Higher noise for diversity
+        self.centers.data += torch.randn_like(self.centers) * 0.05
         
     def forward(self, x):
-        # Compute pairwise distances to cluster centers
-        # x: (batch_size, feature_dim)
-        distances = torch.cdist(x.unsqueeze(1), self.centers.unsqueeze(0))  # (batch_size, 1, n_clusters)
-        distances = distances.squeeze(1)  # (batch_size, n_clusters)
-        
-        # Soft assignments using temperature-scaled softmax
+        distances = torch.cdist(x.unsqueeze(1), self.centers.unsqueeze(0)).squeeze(1)
         assignments = F.softmax(-distances / self.temperature, dim=1)
-        
         return assignments, distances
 
 # BDKM-NF Model
 class BDKMNF(nn.Module):
-    def __init__(self, input_dim=784, hidden_dim=128, num_clusters=10, temperature=1.0):
+    def __init__(self, input_dim=784, hidden_dim=128, num_clusters=10, temperature=5.0):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_clusters = num_clusters
         
-        # Encoder network
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 512),
             nn.ReLU(),
@@ -67,10 +59,8 @@ class BDKMNF(nn.Module):
             nn.Linear(256, hidden_dim)
         )
         
-        # Differentiable K-Means layer
         self.kmeans_layer = DifferentiableKMeans(num_clusters, hidden_dim, temperature)
         
-        # Decoder network
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim, 256),
             nn.ReLU(),
@@ -79,44 +69,31 @@ class BDKMNF(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(512, input_dim),
-            nn.Sigmoid()  # For MNIST pixel values [0,1]
+            nn.Sigmoid()
         )
         
-        # Bayesian priors
         self.prior_mu = torch.zeros(num_clusters, hidden_dim)
         self.prior_std = torch.ones(num_clusters, hidden_dim)
         
-    def reparameterize(self, z, noise_std=0.1):
-        """Reparameterization trick for stochasticity"""
+    def reparameterize(self, z, noise_std=0.2):
         if self.training:
             eps = torch.randn_like(z) * noise_std
             return z + eps
         return z
     
-    def forward(self, x, noise_std=0.1):
-        # Encode
+    def forward(self, x, noise_std=0.2):
         h = self.encoder(x.view(-1, self.input_dim))
-        
-        # Add stochasticity via reparameterization trick
         z = self.reparameterize(h, noise_std)
-        
-        # Clustering
         assignments, distances = self.kmeans_layer(z)
-        
-        # Decode
         x_hat = self.decoder(z)
-        
-        # Compute Bayesian KL divergence for cluster centers
         kl_centers = self.compute_center_kl()
-        
         return x_hat, assignments, distances, z, kl_centers
     
     def compute_center_kl(self):
-        """Compute KL divergence between cluster centers and prior"""
         centers = self.kmeans_layer.centers
         prior_dist = torch.distributions.Normal(self.prior_mu.to(centers.device), 
                                               self.prior_std.to(centers.device))
-        post_dist = torch.distributions.Normal(centers, torch.ones_like(centers) * 0.1)
+        post_dist = torch.distributions.Normal(centers, torch.ones_like(centers) * 0.05)  # Tighter
         kl = torch.distributions.kl_divergence(post_dist, prior_dist).sum()
         return kl
 
@@ -144,51 +121,52 @@ class BayesianClustering(nn.Module):
         x_hat = self.decoder(h)
         return x_hat, assignments, h
 
-# Loss function
-def compute_loss(model, x, beta=0.1):
+# Loss function (stronger balance and entropy terms)
+def compute_loss(model, x, beta=1.0):
     x_hat, assignments, distances, z, kl_centers = model(x)
-    
-    # Reconstruction loss
     recon_loss = F.mse_loss(x_hat, x.view(-1, 784))
-    
-    # Assignment entropy regularization (encourage confident assignments)
+    # Encourage confident assignments (lower entropy)
     assignment_entropy = -torch.sum(assignments * torch.log(assignments + 1e-10), dim=1).mean()
-    
-    # Cluster balance loss (encourage uniform assignments)
+    # Stronger balance: negative entropy on cluster probs
     cluster_sizes = assignments.sum(dim=0)
-    balance_loss = (cluster_sizes / cluster_sizes.sum() * torch.log(cluster_sizes / cluster_sizes.sum() + 1e-10)).sum()
-    balance_loss = -balance_loss  # Negative entropy for uniformity
-    
-    # Total loss
-    total_loss = recon_loss + beta * (kl_centers + assignment_entropy + 0.01 * balance_loss)
-    
+    probs = cluster_sizes / cluster_sizes.sum()
+    balance_loss = -torch.sum(probs * torch.log(probs + 1e-10))
+    # Higher weights
+    total_loss = recon_loss + beta * kl_centers + 0.1 * assignment_entropy + 0.5 * balance_loss
     return total_loss, recon_loss, kl_centers, assignment_entropy
 
-# Training function
-def train_model(model, train_loader, val_loader, epochs=10, lr=1e-4, beta=0.1):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+# Training function (lower LR, clipping, decay, debug logging)
+def train_model(model, train_loader, val_loader, epochs=20, lr=5e-4, beta=1.0):
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
-    patience = 5
+    patience = 7
     patience_counter = 0
     
     for epoch in range(epochs):
-        # Training
         model.train()
         train_loss = 0
         for batch_idx, (data, _) in enumerate(train_loader):
             optimizer.zero_grad()
-            loss, recon_loss, kl_loss, entropy_loss = compute_loss(model, data, beta)
+            loss, _, _, _ = compute_loss(model, data, beta)
             loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item()
+            
+            # Debug: Log unique clusters every 50 batches on first epoch, then every 100
+            if (epoch == 0 and batch_idx % 50 == 0) or (epoch > 0 and batch_idx % 100 == 0):
+                with torch.no_grad():
+                    sample_assign = model(data)[1]
+                    sample_pred = torch.argmax(sample_assign, dim=1)
+                    print(f"Epoch {epoch+1}, Batch {batch_idx}: Unique clusters = {len(torch.unique(sample_pred))}")
         
         train_loss /= len(train_loader)
         train_losses.append(train_loss)
         
-        # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -201,7 +179,6 @@ def train_model(model, train_loader, val_loader, epochs=10, lr=1e-4, beta=0.1):
         
         print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -214,7 +191,7 @@ def train_model(model, train_loader, val_loader, epochs=10, lr=1e-4, beta=0.1):
     
     return train_losses, val_losses
 
-# Evaluation functions
+# Evaluation functions (unchanged from your fixed version)
 def evaluate_clustering(model, data_loader, true_labels=None):
     model.eval()
     all_embeddings = []
@@ -233,16 +210,14 @@ def evaluate_clustering(model, data_loader, true_labels=None):
     assignments = np.vstack(all_assignments)
     pred_labels = np.argmax(assignments, axis=1)
     
-    # Check number of unique labels
     unique_labels = len(np.unique(pred_labels))
-    print(f"Number of unique predicted labels: {unique_labels}")  # Debug print
+    print(f"Number of unique predicted labels: {unique_labels}")
     
-    # Silhouette score only if enough clusters
     if unique_labels > 1:
         sil_score = silhouette_score(embeddings, pred_labels)
     else:
         print("Warning: Only 1 unique cluster detected. Setting silhouette score to -1.0.")
-        sil_score = -1.0  # Or use np.nan if you prefer
+        sil_score = -1.0
     
     results = {'silhouette': sil_score}
     
@@ -254,26 +229,25 @@ def evaluate_clustering(model, data_loader, true_labels=None):
     
     return results, embeddings, assignments, pred_labels
 
-# Uncertainty analysis
+# Uncertainty analysis (unchanged)
 def analyze_uncertainty(model, data_loader, n_samples=10):
-    model.train()  # Enable stochasticity
+    model.train()
     all_uncertainties = []
     
     for data, _ in data_loader:
         uncertainties = []
         for _ in range(n_samples):
             with torch.no_grad():
-                _, assignments, _, _, _ = model(data, noise_std=0.1)
+                _, assignments, _, _, _ = model(data, noise_std=0.2)
                 uncertainties.append(assignments.numpy())
         
-        # Compute variance across samples
         uncertainties = np.stack(uncertainties)
-        uncertainty = np.var(uncertainties, axis=0).mean(axis=1)  # Average uncertainty per sample
+        uncertainty = np.var(uncertainties, axis=0).mean(axis=1)
         all_uncertainties.extend(uncertainty)
     
     return np.array(all_uncertainties)
 
-# Visualization functions
+# Visualization functions (unchanged, but fixed s for low uncertainty)
 def plot_training_curves(train_losses, val_losses):
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Train Loss')
@@ -285,7 +259,6 @@ def plot_training_curves(train_losses, val_losses):
     plt.show()
 
 def plot_clusters_tsne(embeddings, pred_labels, true_labels=None, uncertainties=None):
-    # t-SNE visualization
     tsne = TSNE(n_components=2, random_state=42)
     embeddings_2d = tsne.fit_transform(embeddings)
     
@@ -293,8 +266,7 @@ def plot_clusters_tsne(embeddings, pred_labels, true_labels=None, uncertainties=
     if true_labels is None:
         axes = [axes]
     
-    # Plot predicted clusters
-    s = 50 if uncertainties is None else 50 / (uncertainties[:len(embeddings_2d)] + 1e-8)  # Avoid div by zero
+    s = 50 if uncertainties is None else 50 / (uncertainties[:len(embeddings_2d)] + 1e-8)
     scatter = axes[0].scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], 
                              c=pred_labels, cmap='tab10', s=s)
     axes[0].set_title('Predicted Clusters (t-SNE)')
@@ -310,10 +282,8 @@ def plot_clusters_tsne(embeddings, pred_labels, true_labels=None, uncertainties=
     plt.show()
 
 def main():
-    # Set seed for reproducibility
     set_seed(42)
     
-    # Load MNIST dataset
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.0,), (1.0,))
@@ -324,12 +294,10 @@ def main():
     test_dataset = torchvision.datasets.MNIST(root='./data', train=False, 
                                             download=True, transform=transform)
     
-    # Split training data
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
     
-    # Create data loaders (num_workers=0 to avoid multiprocessing issues)
     train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=0)
@@ -339,22 +307,17 @@ def main():
     print(f"Validation samples: {len(val_dataset)}")
     print(f"Test samples: {len(test_dataset)}")
     
-    # Initialize models
-    bdkm_model = BDKMNF(input_dim=784, hidden_dim=128, num_clusters=10)
+    bdkm_model = BDKMNF(input_dim=784, hidden_dim=128, num_clusters=10, temperature=5.0)
     baseline_model = BayesianClustering(input_dim=784, hidden_dim=128, num_clusters=10)
     
     print("\nTraining BDKM-NF model...")
-    # Train BDKM-NF
     train_losses, val_losses = train_model(bdkm_model, train_loader, val_loader, 
-                                         epochs=10, lr=1e-4, beta=0.1)
+                                         epochs=20, lr=5e-4, beta=1.0)
     
-    # Load best model
     bdkm_model.load_state_dict(torch.load('best_model.pth'))
     
-    # Plot training curves
     plot_training_curves(train_losses, val_losses)
     
-    # Evaluate on test set
     print("\nEvaluating BDKM-NF model...")
     results, embeddings, assignments, pred_labels = evaluate_clustering(
         bdkm_model, test_loader, true_labels=True)
@@ -364,26 +327,21 @@ def main():
     print(f"ARI Score: {results['ari']:.4f}")
     print(f"NMI Score: {results['nmi']:.4f}")
     
-    # Analyze uncertainty
     print("\nAnalyzing uncertainty...")
     uncertainties = analyze_uncertainty(bdkm_model, test_loader, n_samples=10)
     print(f"Average uncertainty: {np.mean(uncertainties):.4f}")
     
-    # Get true labels for visualization
     true_labels = []
     for _, labels in test_loader:
         true_labels.extend(labels.numpy())
     true_labels = np.array(true_labels)
     
-    # Visualizations
     print("\nGenerating visualizations...")
     plot_clusters_tsne(embeddings, pred_labels, true_labels, uncertainties)
     
-    # Train baseline for comparison
     print("\nTraining baseline model...")
-    
-    def train_baseline(model, train_loader, val_loader, epochs=10):
-        optimizer = optim.Adam(model.parameters(), lr=1e-4)  # Match reduced LR
+    def train_baseline(model, train_loader, val_loader, epochs=20, lr=5e-4):
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
         for epoch in range(epochs):
             model.train()
             for data, _ in train_loader:
@@ -391,16 +349,16 @@ def main():
                 x_hat, assignments, h = model(data)
                 recon_loss = F.mse_loss(x_hat, data.view(-1, 784))
                 entropy_loss = -torch.sum(assignments * torch.log(assignments + 1e-10), dim=1).mean()
-                loss = recon_loss + 0.1 * entropy_loss
+                loss = recon_loss + 0.5 * entropy_loss  # Stronger
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             
-            if epoch % 5 == 0:  # More frequent logging
+            if epoch % 5 == 0:
                 print(f'Baseline Epoch {epoch+1}/{epochs}')
     
     train_baseline(baseline_model, train_loader, val_loader)
     
-    # Evaluate baseline
     def evaluate_baseline(model, data_loader):
         model.eval()
         all_embeddings = []
@@ -419,16 +377,14 @@ def main():
         pred_labels = np.array(all_pred_labels)
         true_labels = np.array(all_true_labels)
         
-        # Check number of unique labels
         unique_labels = len(np.unique(pred_labels))
-        print(f"Baseline number of unique predicted labels: {unique_labels}")  # Debug print
+        print(f"Baseline number of unique predicted labels: {unique_labels}")
         
-        # Silhouette score only if enough clusters
         if unique_labels > 1:
             sil_score = silhouette_score(embeddings, pred_labels)
         else:
             print("Warning: Only 1 unique cluster detected in baseline. Setting silhouette score to -1.0.")
-            sil_score = -1.0  # Or use np.nan if you prefer
+            sil_score = -1.0
         
         ari_score = adjusted_rand_score(true_labels, pred_labels)
         nmi_score = normalized_mutual_info_score(true_labels, pred_labels)
@@ -442,7 +398,6 @@ def main():
     print(f"ARI Score: {baseline_results['ari']:.4f}")
     print(f"NMI Score: {baseline_results['nmi']:.4f}")
     
-    # Comparison table
     comparison_df = pd.DataFrame({
         'Model': ['BDKM-NF', 'Baseline'],
         'Silhouette': [results['silhouette'], baseline_results['silhouette']],
@@ -453,7 +408,6 @@ def main():
     print("\nComparison Results:")
     print(comparison_df.to_string(index=False))
     
-    # Statistical significance test (would need multiple runs)
     print(f"\nBDKM-NF shows improvement over baseline:")
     print(f"Silhouette: {results['silhouette'] - baseline_results['silhouette']:.4f}")
     print(f"ARI: {results['ari'] - baseline_results['ari']:.4f}")
