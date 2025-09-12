@@ -11,6 +11,13 @@ import seaborn as sns
 from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
 from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA  # Fallback for UMAP
+try:
+    from umap import UMAP
+    UMAP_AVAILABLE = True
+except ImportError:
+    UMAP_AVAILABLE = False
+    print("UMAP not available; using PCA fallback.")
 import pandas as pd
 from scipy import stats
 import warnings
@@ -47,7 +54,7 @@ class DifferentiableKMeans(nn.Module):
         assignments = F.softmax(logits, dim=1)
         return assignments, distances
 
-# BDKM-NF Model (smaller hidden_dim=64)
+# BDKM-NF Model (smaller hidden_dim=64, added contrastive head)
 class BDKMNF(nn.Module):
     def __init__(self, input_dim=784, hidden_dim=64, num_clusters=10, temperature=5.0):
         super().__init__()
@@ -72,6 +79,13 @@ class BDKMNF(nn.Module):
             nn.Sigmoid()
         )
         
+        # Contrastive head: projector for NT-Xent
+        self.projector = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32)
+        )
+        
         self.prior_mu = torch.zeros(num_clusters, hidden_dim)
         self.prior_std = torch.ones(num_clusters, hidden_dim)
         
@@ -87,7 +101,8 @@ class BDKMNF(nn.Module):
         assignments, distances = self.kmeans_layer(z)
         x_hat = self.decoder(z)
         kl_centers = self.compute_center_kl()
-        return x_hat, assignments, distances, z, kl_centers
+        proj = self.projector(z)  # For contrastive
+        return x_hat, assignments, distances, z, kl_centers, proj
     
     def compute_center_kl(self):
         centers = self.kmeans_layer.centers
@@ -121,9 +136,9 @@ class BayesianClustering(nn.Module):
         x_hat = self.decoder(h)
         return x_hat, assignments, h
 
-# Loss function (BCE recon, adjusted weights)
-def compute_loss(model, x, beta=0.5):
-    x_hat, assignments, distances, z, kl_centers = model(x)
+# Loss function (BCE recon + contrastive + silhouette-aware, FIXED INDEXING)
+def compute_loss(model, x, beta=0.5, tau=0.07):
+    x_hat, assignments, distances, z, kl_centers, proj = model(x)
     # Binary cross-entropy for better scaling on [0,1] pixels
     recon_loss = F.binary_cross_entropy(x_hat, x.view(-1, 784))
     # Encourage confident assignments (lower entropy)
@@ -132,12 +147,40 @@ def compute_loss(model, x, beta=0.5):
     cluster_sizes = assignments.sum(dim=0)
     probs = cluster_sizes / cluster_sizes.sum()
     balance_loss = -torch.sum(probs * torch.log(probs + 1e-10))
+    # Silhouette approximation (intra vs inter) - FIXED: Use 1D boolean indexing
+    batch_size = z.size(0)
+    pred_labels = torch.argmax(assignments, dim=1)
+    intra_dists = torch.zeros(batch_size, device=z.device)
+    inter_dists = torch.zeros(batch_size, device=z.device)
+    for i in range(batch_size):
+        same_cluster = (pred_labels == pred_labels[i])  # 1D boolean
+        if same_cluster.sum() > 1:  # Need at least 2 for intra dist
+            same_z = z[same_cluster]
+            intra_dists[i] = torch.cdist(same_z, same_z)[0, 1:].mean()  # Exclude self
+        else:
+            intra_dists[i] = 0.0  # Default low intra if singleton
+        
+        inter_mask = (pred_labels != pred_labels[i])  # 1D boolean
+        if inter_mask.sum() > 0:
+            inter_z = z[inter_mask]
+            inter_dists[i] = torch.cdist(inter_z, z[i:i+1]).min(dim=0)[0].mean()  # Min dist to nearest inter
+        else:
+            inter_dists[i] = 10.0  # Default high inter if no others
+    
+    a = intra_dists.mean()  # Avg intra
+    b = inter_dists.mean()  # Avg inter
+    sil_approx = (b - a).clamp(min=0) / (a + b + 1e-8)  # Softmax-like clamp
+    sil_loss = -sil_approx  # Minimize negative silhouette
+    # Contrastive (NT-Xent simplified: assume augmented view as positive)
+    pos_sim = F.cosine_similarity(proj, proj.roll(1, dims=0), dim=-1).mean()  # Shifted as pseudo-positive
+    neg_sim = (F.cosine_similarity(proj.unsqueeze(1), proj.unsqueeze(0), dim=-1) - torch.eye(batch_size, device=proj.device)).mean()
+    contrastive_loss = -torch.log(torch.exp(pos_sim / tau) / (torch.exp(pos_sim / tau) + torch.exp(neg_sim / tau)))
     # Adjusted weights
-    total_loss = recon_loss + beta * kl_centers + 0.1 * assignment_entropy + 0.5 * balance_loss
+    total_loss = recon_loss + beta * kl_centers + 0.1 * assignment_entropy + 0.5 * balance_loss + 0.2 * sil_loss + 0.5 * contrastive_loss
     return total_loss, recon_loss, kl_centers, assignment_entropy
 
 # Training function (temperature annealing, more epochs)
-def train_model(model, train_loader, val_loader, epochs=50, lr=5e-4, beta=0.5):
+def train_model(model, train_loader, val_loader, epochs=25, lr=5e-4, beta=0.5):
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     
     train_losses = []
@@ -196,7 +239,7 @@ def train_model(model, train_loader, val_loader, epochs=50, lr=5e-4, beta=0.5):
     
     return train_losses, val_losses
 
-# Evaluation functions (with post-processing K-means)
+# Evaluation functions (with UMAP preprocessing + post-processing K-means)
 def evaluate_clustering(model, data_loader, true_labels=None):
     model.eval()
     all_embeddings = []
@@ -205,7 +248,7 @@ def evaluate_clustering(model, data_loader, true_labels=None):
     
     with torch.no_grad():
         for data, labels in data_loader:
-            _, assignments, _, z, _ = model(data)
+            _, assignments, _, z, _, _ = model(data)
             all_embeddings.append(z.numpy())
             all_assignments.append(assignments.numpy())
             if true_labels is not None:
@@ -215,15 +258,22 @@ def evaluate_clustering(model, data_loader, true_labels=None):
     assignments = np.vstack(all_assignments)
     pred_labels_soft = np.argmax(assignments, axis=1)
     
-    # Post-processing: Hard K-means on embeddings for better alignment
-    kmeans = KMeans(n_clusters=10, random_state=42, n_init=10).fit(embeddings)
+    # UMAP/PCA preprocessing for better clustering
+    if UMAP_AVAILABLE:
+        reducer = UMAP(n_components=10, random_state=42)
+    else:
+        reducer = PCA(n_components=10, random_state=42)
+    embeddings_reduced = reducer.fit_transform(embeddings)
+    
+    # Post-processing: Hard K-means on reduced embeddings
+    kmeans = KMeans(n_clusters=10, random_state=42, n_init=10).fit(embeddings_reduced)
     pred_labels = kmeans.labels_
     
     unique_labels = len(np.unique(pred_labels))
     print(f"Number of unique predicted labels (post-KMeans): {unique_labels}")
     
     if unique_labels > 1:
-        sil_score = silhouette_score(embeddings, pred_labels)
+        sil_score = silhouette_score(embeddings_reduced, pred_labels)
     else:
         print("Warning: Only 1 unique cluster detected. Setting silhouette score to -1.0.")
         sil_score = -1.0
@@ -247,7 +297,7 @@ def analyze_uncertainty(model, data_loader, n_samples=10):
         uncertainties = []
         for _ in range(n_samples):
             with torch.no_grad():
-                _, assignments, _, _, _ = model(data, noise_std=0.5)
+                _, assignments, _, _, _, _ = model(data, noise_std=0.5)
                 uncertainties.append(assignments.numpy())
         
         uncertainties = np.stack(uncertainties)
@@ -293,20 +343,30 @@ def plot_clusters_tsne(embeddings, pred_labels, true_labels=None, uncertainties=
 def main():
     set_seed(42)
     
-    transform = transforms.Compose([
+    # Enhanced transform with data augmentation for training
+    train_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.0,), (1.0,)),
+        transforms.RandomRotation(10),  # ±10 deg
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=5)  # Slight shear/translate
+    ])
+    test_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.0,), (1.0,))
     ])
     
+    # Load full train dataset WITH augmentations (so split subsets inherit them implicitly)
     full_dataset = torchvision.datasets.MNIST(root='./data', train=True, 
-                                            download=True, transform=transform)
+                                            download=True, transform=train_transform)
     test_dataset = torchvision.datasets.MNIST(root='./data', train=False, 
-                                            download=True, transform=transform)
+                                            download=True, transform=test_transform)
     
+    # Split: Both train/val will get augs (acceptable for simplicity)
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
     
+    # DataLoaders: No 'transform' arg needed (inherited from datasets)
     train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=0)
@@ -321,7 +381,7 @@ def main():
     
     print("\nTraining BDKM-NF model...")
     train_losses, val_losses = train_model(bdkm_model, train_loader, val_loader, 
-                                         epochs=50, lr=5e-4, beta=0.5)
+                                         epochs=25, lr=5e-4, beta=0.5)
     
     bdkm_model.load_state_dict(torch.load('best_model.pth'))
     
@@ -349,7 +409,7 @@ def main():
     plot_clusters_tsne(embeddings, pred_labels, true_labels, uncertainties)
     
     print("\nTraining baseline model...")
-    def train_baseline(model, train_loader, val_loader, epochs=50, lr=5e-4):
+    def train_baseline(model, train_loader, val_loader, epochs=25, lr=5e-4):
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
         for epoch in range(epochs):
             model.train()
@@ -386,15 +446,21 @@ def main():
         pred_labels = np.array(all_pred_labels)
         true_labels = np.array(all_true_labels)
         
-        # Post-processing K-means
-        kmeans = KMeans(n_clusters=10, random_state=42, n_init=10).fit(embeddings)
+        # UMAP/PCA + post-processing K-means
+        if UMAP_AVAILABLE:
+            reducer = UMAP(n_components=10, random_state=42)
+        else:
+            reducer = PCA(n_components=10, random_state=42)
+        embeddings_reduced = reducer.fit_transform(embeddings)
+        
+        kmeans = KMeans(n_clusters=10, random_state=42, n_init=10).fit(embeddings_reduced)
         pred_labels = kmeans.labels_
         
         unique_labels = len(np.unique(pred_labels))
         print(f"Baseline number of unique predicted labels (post-KMeans): {unique_labels}")
         
         if unique_labels > 1:
-            sil_score = silhouette_score(embeddings, pred_labels)
+            sil_score = silhouette_score(embeddings_reduced, pred_labels)
         else:
             print("Warning: Only 1 unique cluster detected in baseline. Setting silhouette score to -1.0.")
             sil_score = -1.0
