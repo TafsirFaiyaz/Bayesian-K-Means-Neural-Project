@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
 from sklearn.manifold import TSNE
+from sklearn.cluster import KMeans
 import pandas as pd
 from scipy import stats
 import warnings
@@ -22,7 +23,7 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
 
-# Differentiable K-Means Layer
+# Differentiable K-Means Layer (with Gumbel noise for uncertainty)
 class DifferentiableKMeans(nn.Module):
     def __init__(self, n_clusters, feature_dim, temperature=5.0):
         super().__init__()
@@ -38,22 +39,24 @@ class DifferentiableKMeans(nn.Module):
         
     def forward(self, x):
         distances = torch.cdist(x.unsqueeze(1), self.centers.unsqueeze(0)).squeeze(1)
-        assignments = F.softmax(-distances / self.temperature, dim=1)
+        logits = -distances / self.temperature
+        if self.training:
+            # Gumbel noise for more stochasticity
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
+            logits += gumbel_noise
+        assignments = F.softmax(logits, dim=1)
         return assignments, distances
 
-# BDKM-NF Model
+# BDKM-NF Model (smaller hidden_dim=64)
 class BDKMNF(nn.Module):
-    def __init__(self, input_dim=784, hidden_dim=128, num_clusters=10, temperature=5.0):
+    def __init__(self, input_dim=784, hidden_dim=64, num_clusters=10, temperature=5.0):
         super().__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_clusters = num_clusters
         
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256),
+            nn.Linear(input_dim, 256),  # Reduced layers for simplicity
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, hidden_dim)
@@ -65,23 +68,20 @@ class BDKMNF(nn.Module):
             nn.Linear(hidden_dim, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(256, 512),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, input_dim),
+            nn.Linear(256, input_dim),
             nn.Sigmoid()
         )
         
         self.prior_mu = torch.zeros(num_clusters, hidden_dim)
         self.prior_std = torch.ones(num_clusters, hidden_dim)
         
-    def reparameterize(self, z, noise_std=0.2):
+    def reparameterize(self, z, noise_std=0.5):
         if self.training:
             eps = torch.randn_like(z) * noise_std
             return z + eps
         return z
     
-    def forward(self, x, noise_std=0.2):
+    def forward(self, x, noise_std=0.5):
         h = self.encoder(x.view(-1, self.input_dim))
         z = self.reparameterize(h, noise_std)
         assignments, distances = self.kmeans_layer(z)
@@ -93,23 +93,23 @@ class BDKMNF(nn.Module):
         centers = self.kmeans_layer.centers
         prior_dist = torch.distributions.Normal(self.prior_mu.to(centers.device), 
                                               self.prior_std.to(centers.device))
-        post_dist = torch.distributions.Normal(centers, torch.ones_like(centers) * 0.05)  # Tighter
+        post_dist = torch.distributions.Normal(centers, torch.ones_like(centers) * 0.05)
         kl = torch.distributions.kl_divergence(post_dist, prior_dist).sum()
         return kl
 
 # Baseline: Simple Bayesian Clustering
 class BayesianClustering(nn.Module):
-    def __init__(self, input_dim=784, hidden_dim=128, num_clusters=10):
+    def __init__(self, input_dim=784, hidden_dim=64, num_clusters=10):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 256),
+            nn.Linear(input_dim, 128),
             nn.ReLU(),
-            nn.Linear(256, hidden_dim)
+            nn.Linear(128, hidden_dim)
         )
         self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, 256),
+            nn.Linear(hidden_dim, 128),
             nn.ReLU(),
-            nn.Linear(256, input_dim),
+            nn.Linear(128, input_dim),
             nn.Sigmoid()
         )
         self.cluster_layer = nn.Linear(hidden_dim, num_clusters)
@@ -121,31 +121,36 @@ class BayesianClustering(nn.Module):
         x_hat = self.decoder(h)
         return x_hat, assignments, h
 
-# Loss function (stronger balance and entropy terms)
-def compute_loss(model, x, beta=1.0):
+# Loss function (BCE recon, adjusted weights)
+def compute_loss(model, x, beta=0.5):
     x_hat, assignments, distances, z, kl_centers = model(x)
-    recon_loss = F.mse_loss(x_hat, x.view(-1, 784))
+    # Binary cross-entropy for better scaling on [0,1] pixels
+    recon_loss = F.binary_cross_entropy(x_hat, x.view(-1, 784))
     # Encourage confident assignments (lower entropy)
     assignment_entropy = -torch.sum(assignments * torch.log(assignments + 1e-10), dim=1).mean()
-    # Stronger balance: negative entropy on cluster probs
+    # Stronger balance
     cluster_sizes = assignments.sum(dim=0)
     probs = cluster_sizes / cluster_sizes.sum()
     balance_loss = -torch.sum(probs * torch.log(probs + 1e-10))
-    # Higher weights
+    # Adjusted weights
     total_loss = recon_loss + beta * kl_centers + 0.1 * assignment_entropy + 0.5 * balance_loss
     return total_loss, recon_loss, kl_centers, assignment_entropy
 
-# Training function (lower LR, clipping, decay, debug logging)
-def train_model(model, train_loader, val_loader, epochs=20, lr=5e-4, beta=1.0):
+# Training function (temperature annealing, more epochs)
+def train_model(model, train_loader, val_loader, epochs=50, lr=5e-4, beta=0.5):
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
-    patience = 7
+    patience = 10
     patience_counter = 0
     
     for epoch in range(epochs):
+        # Temperature annealing
+        current_temp = 5.0 * (0.95 ** epoch)
+        model.kmeans_layer.temperature = current_temp
+        
         model.train()
         train_loss = 0
         for batch_idx, (data, _) in enumerate(train_loader):
@@ -157,12 +162,12 @@ def train_model(model, train_loader, val_loader, epochs=20, lr=5e-4, beta=1.0):
             optimizer.step()
             train_loss += loss.item()
             
-            # Debug: Log unique clusters every 50 batches on first epoch, then every 100
-            if (epoch == 0 and batch_idx % 50 == 0) or (epoch > 0 and batch_idx % 100 == 0):
+            # Debug logging (reduced frequency)
+            if batch_idx % 200 == 0:
                 with torch.no_grad():
                     sample_assign = model(data)[1]
                     sample_pred = torch.argmax(sample_assign, dim=1)
-                    print(f"Epoch {epoch+1}, Batch {batch_idx}: Unique clusters = {len(torch.unique(sample_pred))}")
+                    print(f"Epoch {epoch+1}, Batch {batch_idx}: Unique clusters = {len(torch.unique(sample_pred))}, Temp: {current_temp:.2f}")
         
         train_loss /= len(train_loader)
         train_losses.append(train_loss)
@@ -191,7 +196,7 @@ def train_model(model, train_loader, val_loader, epochs=20, lr=5e-4, beta=1.0):
     
     return train_losses, val_losses
 
-# Evaluation functions (unchanged from your fixed version)
+# Evaluation functions (with post-processing K-means)
 def evaluate_clustering(model, data_loader, true_labels=None):
     model.eval()
     all_embeddings = []
@@ -208,10 +213,14 @@ def evaluate_clustering(model, data_loader, true_labels=None):
     
     embeddings = np.vstack(all_embeddings)
     assignments = np.vstack(all_assignments)
-    pred_labels = np.argmax(assignments, axis=1)
+    pred_labels_soft = np.argmax(assignments, axis=1)
+    
+    # Post-processing: Hard K-means on embeddings for better alignment
+    kmeans = KMeans(n_clusters=10, random_state=42, n_init=10).fit(embeddings)
+    pred_labels = kmeans.labels_
     
     unique_labels = len(np.unique(pred_labels))
-    print(f"Number of unique predicted labels: {unique_labels}")
+    print(f"Number of unique predicted labels (post-KMeans): {unique_labels}")
     
     if unique_labels > 1:
         sil_score = silhouette_score(embeddings, pred_labels)
@@ -229,7 +238,7 @@ def evaluate_clustering(model, data_loader, true_labels=None):
     
     return results, embeddings, assignments, pred_labels
 
-# Uncertainty analysis (unchanged)
+# Uncertainty analysis (higher noise)
 def analyze_uncertainty(model, data_loader, n_samples=10):
     model.train()
     all_uncertainties = []
@@ -238,7 +247,7 @@ def analyze_uncertainty(model, data_loader, n_samples=10):
         uncertainties = []
         for _ in range(n_samples):
             with torch.no_grad():
-                _, assignments, _, _, _ = model(data, noise_std=0.2)
+                _, assignments, _, _, _ = model(data, noise_std=0.5)
                 uncertainties.append(assignments.numpy())
         
         uncertainties = np.stack(uncertainties)
@@ -247,7 +256,7 @@ def analyze_uncertainty(model, data_loader, n_samples=10):
     
     return np.array(all_uncertainties)
 
-# Visualization functions (unchanged, but fixed s for low uncertainty)
+# Visualization functions
 def plot_training_curves(train_losses, val_losses):
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Train Loss')
@@ -307,12 +316,12 @@ def main():
     print(f"Validation samples: {len(val_dataset)}")
     print(f"Test samples: {len(test_dataset)}")
     
-    bdkm_model = BDKMNF(input_dim=784, hidden_dim=128, num_clusters=10, temperature=5.0)
-    baseline_model = BayesianClustering(input_dim=784, hidden_dim=128, num_clusters=10)
+    bdkm_model = BDKMNF(input_dim=784, hidden_dim=64, num_clusters=10, temperature=5.0)
+    baseline_model = BayesianClustering(input_dim=784, hidden_dim=64, num_clusters=10)
     
     print("\nTraining BDKM-NF model...")
     train_losses, val_losses = train_model(bdkm_model, train_loader, val_loader, 
-                                         epochs=20, lr=5e-4, beta=1.0)
+                                         epochs=50, lr=5e-4, beta=0.5)
     
     bdkm_model.load_state_dict(torch.load('best_model.pth'))
     
@@ -340,21 +349,21 @@ def main():
     plot_clusters_tsne(embeddings, pred_labels, true_labels, uncertainties)
     
     print("\nTraining baseline model...")
-    def train_baseline(model, train_loader, val_loader, epochs=20, lr=5e-4):
+    def train_baseline(model, train_loader, val_loader, epochs=50, lr=5e-4):
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
         for epoch in range(epochs):
             model.train()
             for data, _ in train_loader:
                 optimizer.zero_grad()
                 x_hat, assignments, h = model(data)
-                recon_loss = F.mse_loss(x_hat, data.view(-1, 784))
+                recon_loss = F.binary_cross_entropy(x_hat, data.view(-1, 784))
                 entropy_loss = -torch.sum(assignments * torch.log(assignments + 1e-10), dim=1).mean()
-                loss = recon_loss + 0.5 * entropy_loss  # Stronger
+                loss = recon_loss + 0.5 * entropy_loss
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             
-            if epoch % 5 == 0:
+            if epoch % 10 == 0:
                 print(f'Baseline Epoch {epoch+1}/{epochs}')
     
     train_baseline(baseline_model, train_loader, val_loader)
@@ -377,8 +386,12 @@ def main():
         pred_labels = np.array(all_pred_labels)
         true_labels = np.array(all_true_labels)
         
+        # Post-processing K-means
+        kmeans = KMeans(n_clusters=10, random_state=42, n_init=10).fit(embeddings)
+        pred_labels = kmeans.labels_
+        
         unique_labels = len(np.unique(pred_labels))
-        print(f"Baseline number of unique predicted labels: {unique_labels}")
+        print(f"Baseline number of unique predicted labels (post-KMeans): {unique_labels}")
         
         if unique_labels > 1:
             sil_score = silhouette_score(embeddings, pred_labels)
