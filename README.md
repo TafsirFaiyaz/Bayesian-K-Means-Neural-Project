@@ -1,4 +1,4 @@
-Before running the code make sure pytorch, seaborn and scikit-learn installed.
+Before running the code make sure pytorch, seaborn and scikit-learn are installed.
 
 For that run the below command:
   For pytorch(CPU only):
