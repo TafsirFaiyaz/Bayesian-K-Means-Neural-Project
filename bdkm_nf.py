@@ -11,7 +11,7 @@ import seaborn as sns
 from sklearn.metrics import silhouette_score, adjusted_rand_score, normalized_mutual_info_score
 from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA  # Fallback for UMAP
+from sklearn.decomposition import PCA  
 try:
     from umap import UMAP
     UMAP_AVAILABLE = True
@@ -23,7 +23,7 @@ from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
 
-# Set random seeds for reproducibility
+
 def set_seed(seed=42):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -36,23 +36,30 @@ class DifferentiableKMeans(nn.Module):
         super().__init__()
         self.n_clusters = n_clusters
         self.temperature = temperature
+        
         # Smaller random init for stability
         self.centers = nn.Parameter(torch.randn(n_clusters, feature_dim) * 0.1)
+        
         # Orthogonal with low gain
+        
         if feature_dim >= n_clusters:
             nn.init.orthogonal_(self.centers, gain=0.1)
+            
         # Higher noise for diversity
         self.centers.data += torch.randn_like(self.centers) * 0.05
         
     def forward(self, x):
         distances = torch.cdist(x.unsqueeze(1), self.centers.unsqueeze(0)).squeeze(1)
         logits = -distances / self.temperature
+        
         if self.training:
             # Gumbel noise for more stochasticity
             gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
             logits += gumbel_noise
+            
         assignments = F.softmax(logits, dim=1)
         return assignments, distances
+    
 
 # BDKM-NF Model (smaller hidden_dim=64, added contrastive head)
 class BDKMNF(nn.Module):
@@ -63,7 +70,7 @@ class BDKMNF(nn.Module):
         self.num_clusters = num_clusters
         
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 256),  # Reduced layers for simplicity
+            nn.Linear(input_dim, 256),  
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, hidden_dim)
@@ -139,42 +146,49 @@ class BayesianClustering(nn.Module):
 # Loss function (BCE recon + contrastive + silhouette-aware, FIXED INDEXING)
 def compute_loss(model, x, beta=0.5, tau=0.07):
     x_hat, assignments, distances, z, kl_centers, proj = model(x)
+    
     # Binary cross-entropy for better scaling on [0,1] pixels
     recon_loss = F.binary_cross_entropy(x_hat, x.view(-1, 784))
+    
     # Encourage confident assignments (lower entropy)
     assignment_entropy = -torch.sum(assignments * torch.log(assignments + 1e-10), dim=1).mean()
+    
     # Stronger balance
     cluster_sizes = assignments.sum(dim=0)
     probs = cluster_sizes / cluster_sizes.sum()
     balance_loss = -torch.sum(probs * torch.log(probs + 1e-10))
+    
     # Silhouette approximation (intra vs inter) - FIXED: Use 1D boolean indexing
+    
     batch_size = z.size(0)
     pred_labels = torch.argmax(assignments, dim=1)
     intra_dists = torch.zeros(batch_size, device=z.device)
     inter_dists = torch.zeros(batch_size, device=z.device)
     for i in range(batch_size):
-        same_cluster = (pred_labels == pred_labels[i])  # 1D boolean
-        if same_cluster.sum() > 1:  # Need at least 2 for intra dist
+        same_cluster = (pred_labels == pred_labels[i]) 
+        if same_cluster.sum() > 1: 
             same_z = z[same_cluster]
-            intra_dists[i] = torch.cdist(same_z, same_z)[0, 1:].mean()  # Exclude self
+            intra_dists[i] = torch.cdist(same_z, same_z)[0, 1:].mean()
         else:
-            intra_dists[i] = 0.0  # Default low intra if singleton
+            intra_dists[i] = 0.0  
         
-        inter_mask = (pred_labels != pred_labels[i])  # 1D boolean
+        inter_mask = (pred_labels != pred_labels[i])  
         if inter_mask.sum() > 0:
             inter_z = z[inter_mask]
-            inter_dists[i] = torch.cdist(inter_z, z[i:i+1]).min(dim=0)[0].mean()  # Min dist to nearest inter
+            inter_dists[i] = torch.cdist(inter_z, z[i:i+1]).min(dim=0)[0].mean()  
         else:
-            inter_dists[i] = 10.0  # Default high inter if no others
+            inter_dists[i] = 10.0  
     
-    a = intra_dists.mean()  # Avg intra
-    b = inter_dists.mean()  # Avg inter
+    a = intra_dists.mean()  
+    b = inter_dists.mean()  
     sil_approx = (b - a).clamp(min=0) / (a + b + 1e-8)  # Softmax-like clamp
-    sil_loss = -sil_approx  # Minimize negative silhouette
+    sil_loss = -sil_approx  
+    
     # Contrastive (NT-Xent simplified: assume augmented view as positive)
-    pos_sim = F.cosine_similarity(proj, proj.roll(1, dims=0), dim=-1).mean()  # Shifted as pseudo-positive
+    pos_sim = F.cosine_similarity(proj, proj.roll(1, dims=0), dim=-1).mean()  
     neg_sim = (F.cosine_similarity(proj.unsqueeze(1), proj.unsqueeze(0), dim=-1) - torch.eye(batch_size, device=proj.device)).mean()
     contrastive_loss = -torch.log(torch.exp(pos_sim / tau) / (torch.exp(pos_sim / tau) + torch.exp(neg_sim / tau)))
+    
     # Adjusted weights
     total_loss = recon_loss + beta * kl_centers + 0.1 * assignment_entropy + 0.5 * balance_loss + 0.2 * sil_loss + 0.5 * contrastive_loss
     return total_loss, recon_loss, kl_centers, assignment_entropy
@@ -197,9 +211,11 @@ def train_model(model, train_loader, val_loader, epochs=25, lr=5e-4, beta=0.5):
         model.train()
         train_loss = 0
         for batch_idx, (data, _) in enumerate(train_loader):
+            
             optimizer.zero_grad()
             loss, _, _, _ = compute_loss(model, data, beta)
             loss.backward()
+            
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -217,6 +233,7 @@ def train_model(model, train_loader, val_loader, epochs=25, lr=5e-4, beta=0.5):
         
         model.eval()
         val_loss = 0
+        
         with torch.no_grad():
             for data, _ in val_loader:
                 loss, _, _, _ = compute_loss(model, data, beta)
@@ -231,6 +248,7 @@ def train_model(model, train_loader, val_loader, epochs=25, lr=5e-4, beta=0.5):
             best_val_loss = val_loss
             patience_counter = 0
             torch.save(model.state_dict(), 'best_model.pth')
+            
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -241,6 +259,7 @@ def train_model(model, train_loader, val_loader, epochs=25, lr=5e-4, beta=0.5):
 
 # Evaluation functions (with UMAP preprocessing + post-processing K-means)
 def evaluate_clustering(model, data_loader, true_labels=None):
+    
     model.eval()
     all_embeddings = []
     all_assignments = []
@@ -251,6 +270,7 @@ def evaluate_clustering(model, data_loader, true_labels=None):
             _, assignments, _, z, _, _ = model(data)
             all_embeddings.append(z.numpy())
             all_assignments.append(assignments.numpy())
+            
             if true_labels is not None:
                 all_true_labels.append(labels.numpy())
     
@@ -263,6 +283,7 @@ def evaluate_clustering(model, data_loader, true_labels=None):
         reducer = UMAP(n_components=10, random_state=42)
     else:
         reducer = PCA(n_components=10, random_state=42)
+        
     embeddings_reduced = reducer.fit_transform(embeddings)
     
     # Post-processing: Hard K-means on reduced embeddings
@@ -350,6 +371,7 @@ def main():
         transforms.RandomRotation(10),  # ±10 deg
         transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), shear=5)  # Slight shear/translate
     ])
+    
     test_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.0,), (1.0,))
@@ -358,6 +380,7 @@ def main():
     # Load full train dataset WITH augmentations (so split subsets inherit them implicitly)
     full_dataset = torchvision.datasets.MNIST(root='./data', train=True, 
                                             download=True, transform=train_transform)
+    
     test_dataset = torchvision.datasets.MNIST(root='./data', train=False, 
                                             download=True, transform=test_transform)
     
@@ -410,16 +433,21 @@ def main():
     
     print("\nTraining baseline model...")
     def train_baseline(model, train_loader, val_loader, epochs=25, lr=5e-4):
+        
         optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+        
         for epoch in range(epochs):
             model.train()
+            
             for data, _ in train_loader:
                 optimizer.zero_grad()
                 x_hat, assignments, h = model(data)
                 recon_loss = F.binary_cross_entropy(x_hat, data.view(-1, 784))
+                
                 entropy_loss = -torch.sum(assignments * torch.log(assignments + 1e-10), dim=1).mean()
                 loss = recon_loss + 0.5 * entropy_loss
                 loss.backward()
+                
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
             
@@ -435,7 +463,9 @@ def main():
         all_true_labels = []
         
         with torch.no_grad():
+            
             for data, labels in data_loader:
+                
                 _, assignments, h = model(data)
                 pred_labels_batch = np.argmax(assignments.numpy(), axis=1)
                 all_embeddings.append(h.numpy())
@@ -451,6 +481,7 @@ def main():
             reducer = UMAP(n_components=10, random_state=42)
         else:
             reducer = PCA(n_components=10, random_state=42)
+            
         embeddings_reduced = reducer.fit_transform(embeddings)
         
         kmeans = KMeans(n_clusters=10, random_state=42, n_init=10).fit(embeddings_reduced)
